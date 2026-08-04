@@ -357,19 +357,6 @@ class KVCacheManager:
                 apply_admission_cap=True,
             )
             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-                if num_external_computed_tokens > 0:
-                    logger.warning(
-                        "[QWEN35_PD_D] stage=external_alloc_reject "
-                        "reason=full_sequence request_id=%s "
-                        "required_blocks=%s available_blocks=%s "
-                        "num_external_computed_tokens=%s "
-                        "full_sequence_must_fit=%s",
-                        request.request_id,
-                        num_blocks_to_allocate,
-                        self.block_pool.get_num_free_blocks(),
-                        num_external_computed_tokens,
-                        full_sequence_must_fit,
-                    )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -399,19 +386,6 @@ class KVCacheManager:
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
-            if num_external_computed_tokens > 0:
-                logger.warning(
-                    "[QWEN35_PD_D] stage=external_alloc_reject "
-                    "reason=capacity request_id=%s "
-                    "required_blocks=%s available_blocks=%s "
-                    "num_external_computed_tokens=%s "
-                    "full_sequence_must_fit=%s",
-                    request.request_id,
-                    num_blocks_to_allocate,
-                    self.block_pool.get_num_free_blocks(),
-                    num_external_computed_tokens,
-                    full_sequence_must_fit,
-                )
             return None
 
         if (
