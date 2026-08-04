@@ -712,7 +712,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled.
                             break
 
-                if self.need_mamba_block_aligned_split:
+                if self.need_mamba_block_aligned_split and not load_kv_async:
                     if num_external_computed_tokens > 0:
                         logger.warning(
                             "[QWEN35_PD_D] stage=mamba_split_call "
