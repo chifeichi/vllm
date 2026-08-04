@@ -283,6 +283,19 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
+        if num_external_computed_tokens > 0:
+            logger.warning(
+                "[QWEN35_PD_D] stage=mamba_split_method_enter request_id=%s "
+                "num_new_tokens=%s num_local_tokens=%s external_tokens=%s "
+                "request_computed_tokens=%s prompt_tokens=%s request_tokens=%s",
+                request.request_id,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+                request.num_tokens,
+            )
         assert num_external_computed_tokens == 0, (
             "External KV connector is not verified yet"
         )
@@ -612,6 +625,18 @@ class Scheduler(SchedulerInterface):
 
                         num_external_computed_tokens = ext_tokens
 
+                        if num_external_computed_tokens > 0:
+                            logger.warning(
+                                "[QWEN35_PD_D] stage=external_match_result "
+                                "request_id=%s local_tokens=%s external_tokens=%s "
+                                "load_kv_async=%s need_mamba_split=%s",
+                                request.request_id,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                                load_kv_async,
+                                self.need_mamba_block_aligned_split,
+                            )
+
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
                         )
@@ -688,13 +713,40 @@ class Scheduler(SchedulerInterface):
                             break
 
                 if self.need_mamba_block_aligned_split:
+                    if num_external_computed_tokens > 0:
+                        logger.warning(
+                            "[QWEN35_PD_D] stage=mamba_split_call "
+                            "request_id=%s num_new_tokens=%s "
+                            "external_tokens=%s load_kv_async=%s",
+                            request.request_id,
+                            num_new_tokens,
+                            num_external_computed_tokens,
+                            load_kv_async,
+                        )
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
                     )
+                    if num_external_computed_tokens > 0:
+                        logger.warning(
+                            "[QWEN35_PD_D] stage=mamba_split_result "
+                            "request_id=%s num_new_tokens=%s external_tokens=%s",
+                            request.request_id,
+                            num_new_tokens,
+                            num_external_computed_tokens,
+                        )
                     if num_new_tokens == 0:
+                        if num_external_computed_tokens > 0:
+                            logger.warning(
+                                "[QWEN35_PD_D] stage=waiting_break "
+                                "reason=mamba_zero_tokens request_id=%s "
+                                "load_kv_async=%s external_tokens=%s",
+                                request.request_id,
+                                load_kv_async,
+                                num_external_computed_tokens,
+                            )
                         break
 
                 # Handles an edge case when P/D Disaggregation
@@ -718,6 +770,18 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
+                if num_external_computed_tokens > 0:
+                    logger.warning(
+                        "[QWEN35_PD_D] stage=allocate_slots_enter "
+                        "request_id=%s num_new_tokens=%s external_tokens=%s "
+                        "load_kv_async=%s full_sequence_must_fit=%s",
+                        request.request_id,
+                        num_new_tokens,
+                        num_external_computed_tokens,
+                        load_kv_async,
+                        self.scheduler_reserve_full_isl,
+                    )
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -729,6 +793,15 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                 )
+
+                if num_external_computed_tokens > 0:
+                    logger.warning(
+                        "[QWEN35_PD_D] stage=allocate_slots_result "
+                        "request_id=%s success=%s external_tokens=%s",
+                        request.request_id,
+                        new_blocks is not None,
+                        num_external_computed_tokens,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -744,11 +817,25 @@ class Scheduler(SchedulerInterface):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
+                    if num_external_computed_tokens > 0:
+                        logger.warning(
+                            "[QWEN35_PD_D] stage=connector_update_enter "
+                            "request_id=%s external_tokens=%s",
+                            request.request_id,
+                            num_external_computed_tokens,
+                        )
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
                         num_external_computed_tokens,
                     )
+                    if num_external_computed_tokens > 0:
+                        logger.warning(
+                            "[QWEN35_PD_D] stage=connector_update_done "
+                            "request_id=%s external_tokens=%s",
+                            request.request_id,
+                            num_external_computed_tokens,
+                        )
                     if (
                         self.connector_prefix_cache_stats is not None
                         and connector_prefix_cache_queries != 0
