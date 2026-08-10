@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -118,6 +119,8 @@ class Scheduler(SchedulerInterface):
         self.connector = None
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
+        self._pd_scheduler_log_interval = 0.0
+        self._pd_scheduler_last_log = time.monotonic()
         if self.vllm_config.kv_transfer_config is not None:
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
@@ -133,6 +136,20 @@ class Scheduler(SchedulerInterface):
                 self.vllm_config.kv_transfer_config.kv_load_failure_policy
             )
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+            if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
+                try:
+                    self._pd_scheduler_log_interval = max(
+                        0.0,
+                        float(
+                            os.environ.get(
+                                "VERL_PD_SCHEDULER_LOG_INTERVAL_SECS", "0"
+                            )
+                        ),
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Ignoring invalid VERL_PD_SCHEDULER_LOG_INTERVAL_SECS"
+                    )
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -919,7 +936,46 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._log_pd_decode_scheduler_state(scheduler_output)
         return scheduler_output
+
+    def _log_pd_decode_scheduler_state(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        interval = self._pd_scheduler_log_interval
+        if interval <= 0:
+            return
+        now = time.monotonic()
+        if now - self._pd_scheduler_last_log < interval:
+            return
+        self._pd_scheduler_last_log = now
+
+        remote_kv_waiting = sum(
+            req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            for req in self.skipped_waiting
+        )
+        scheduled_tokens = scheduler_output.num_scheduled_tokens
+        logger.warning(
+            "[VERL_PD_D_SCHEDULER] pid=%s replica_rank=%s running=%d "
+            "waiting_capacity=%d waiting_remote_kv=%d waiting_other=%d "
+            "scheduled_reqs=%d scheduled_tokens=%d decode_step_reqs=%d "
+            "prefill_step_reqs=%d preempted=%d kv_usage=%.3f "
+            "max_num_seqs=%d max_scheduled_tokens=%d",
+            os.getpid(),
+            os.environ.get("VERL_REPLICA_RANK", "unknown"),
+            len(self.running),
+            len(self.waiting),
+            remote_kv_waiting,
+            len(self.skipped_waiting) - remote_kv_waiting,
+            len(scheduled_tokens),
+            scheduler_output.total_num_scheduled_tokens,
+            sum(num_tokens == 1 for num_tokens in scheduled_tokens.values()),
+            sum(num_tokens > 1 for num_tokens in scheduled_tokens.values()),
+            len(scheduler_output.preempted_req_ids),
+            self.kv_cache_manager.usage,
+            self.max_num_running_reqs,
+            self.max_num_scheduled_tokens,
+        )
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
