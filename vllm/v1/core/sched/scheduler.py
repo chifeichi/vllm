@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -59,6 +60,27 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _verl_pd_cache_debug(request: Request) -> bool:
+    params = request.kv_transfer_params or {}
+    return params.get("verl_pd_cache_debug") is True
+
+
+def _verl_pd_debug_ids(request: Request) -> tuple[str, str]:
+    params = request.kv_transfer_params or {}
+    return (
+        str(params.get("verl_pd_session_id", "unknown")),
+        str(params.get("verl_pd_external_request_id", request.request_id)),
+    )
+
+
+def _verl_pd_hash(value: object | None) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, bytes):
+        return value.hex()[:16]
+    return str(value)[:16]
 
 
 class Scheduler(SchedulerInterface):
@@ -622,6 +644,29 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+                    if _verl_pd_cache_debug(request):
+                        self._verl_pd_cache_debug_seen = True
+                        session_id, external_request_id = _verl_pd_debug_ids(request)
+                        lora_id = (
+                            request.lora_request.adapter_id
+                            if request.lora_request is not None
+                            else None
+                        )
+                        print(
+                            f"[VERL_PD_CACHE_SCHED] pid={os.getpid()} "
+                            f"session_id={session_id} request_id={external_request_id} "
+                            f"engine_request_id={request.request_id} "
+                            f"prompt_tokens={request.num_prompt_tokens} "
+                            f"local_hit_tokens={num_new_local_computed_tokens} "
+                            f"external_hit_tokens={num_external_computed_tokens} "
+                            f"cache_salt={request.cache_salt!r} lora_id={lora_id!r} "
+                            f"mm_features={len(request.mm_features)} "
+                            f"skip_prefix_read={request.skip_reading_prefix_cache} "
+                            f"block_hashes={len(request.block_hashes)} "
+                            f"first_hash={_verl_pd_hash(request.block_hashes[0] if request.block_hashes else None)} "
+                            f"last_hash={_verl_pd_hash(request.block_hashes[-1] if request.block_hashes else None)}",
+                            flush=True,
+                        )
 
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
@@ -1859,7 +1904,40 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        debug = _verl_pd_cache_debug(request)
+        if debug:
+            session_id, external_request_id = _verl_pd_debug_ids(request)
+            managers = self.kv_cache_manager.coordinator.single_type_managers
+            before_cached = [
+                manager.num_cached_block.get(request.request_id, 0)
+                for manager in managers
+            ]
+            before_blocks = [
+                len(manager.req_to_blocks.get(request.request_id, ()))
+                for manager in managers
+            ]
+            before_hash_entries = len(
+                self.kv_cache_manager.coordinator.block_pool.cached_block_hash_to_block
+            )
         self.kv_cache_manager.free(request)
+        if debug:
+            _, retained_tokens = self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                request.block_hashes,
+                max(request.num_tokens - 1, 0),
+            )
+            block_pool = self.kv_cache_manager.coordinator.block_pool
+            print(
+                f"[VERL_PD_CACHE_FINISH] pid={os.getpid()} "
+                f"session_id={session_id} request_id={external_request_id} "
+                f"engine_request_id={request.request_id} total_tokens={request.num_tokens} "
+                f"cached_blocks_before_free={before_cached} "
+                f"allocated_blocks_before_free={before_blocks} "
+                f"retained_hit_tokens_after_free={retained_tokens} "
+                f"hash_entries_before={before_hash_entries} "
+                f"hash_entries_after={len(block_pool.cached_block_hash_to_block)} "
+                f"kv_usage_after={block_pool.get_usage():.6f}",
+                flush=True,
+            )
         del self.requests[request.request_id]
 
     @property
@@ -1929,6 +2007,14 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
+        debug_reset = (
+            os.getenv("VERL_PD_SESSION_CACHE_DEBUG", "0") == "1"
+            or getattr(self, "_verl_pd_cache_debug_seen", False)
+        )
+        if debug_reset:
+            block_pool = self.kv_cache_manager.coordinator.block_pool
+            reset_hash_entries_before = len(block_pool.cached_block_hash_to_block)
+            reset_usage_before = block_pool.get_usage()
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
@@ -1940,6 +2026,19 @@ class Scheduler(SchedulerInterface):
 
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
+
+        if debug_reset:
+            block_pool = self.kv_cache_manager.coordinator.block_pool
+            print(
+                f"[VERL_PD_CACHE_RESET] pid={os.getpid()} "
+                f"success={reset_successful} reset_running={reset_running_requests} "
+                f"reset_connector={reset_connector} "
+                f"hash_entries_before={reset_hash_entries_before} "
+                f"hash_entries_after={len(block_pool.cached_block_hash_to_block)} "
+                f"kv_usage_before={reset_usage_before:.6f} "
+                f"kv_usage_after={block_pool.get_usage():.6f}",
+                flush=True,
+            )
 
         return reset_successful
 
