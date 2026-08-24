@@ -55,6 +55,14 @@ from vllm.v1.metrics.stats import IterationStats
 logger = init_logger(__name__)
 
 
+def _partial_rollout_debug_log(stage: str, **details: Any) -> None:
+    enabled_values = {"1", "true", "yes", "on"}
+    if os.environ.get("PARTIAL_ROLLOUT_DEBUG_SYNC", "0").strip().lower() not in enabled_values:
+        return
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    logger.warning("[PR_DEBUG] stage=%s time_ns=%s pid=%s %s", stage, time.time_ns(), os.getpid(), detail_text)
+
+
 class InputStreamError(Exception):
     """Wrapper for errors from the input stream generator.
 
@@ -781,9 +789,12 @@ class AsyncLLM(EngineClient):
                 stacklevel=2,
             )
             mode = "wait"
+        _partial_rollout_debug_log("vllm_pause_generation_begin", mode=mode, clear_cache=clear_cache)
         if clear_cache:
             await self.renderer.clear_mm_cache_async()
+            _partial_rollout_debug_log("vllm_pause_mm_cache_cleared", mode=mode)
         await self.engine_core.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
+        _partial_rollout_debug_log("vllm_pause_scheduler_complete", mode=mode, clear_cache=clear_cache)
         # Small sleep to help ensure that final outputs from any in-flight requests are
         # returned prior to this method returning. These outputs come out of the engine
         # prior to the wait-for-idle completion event, but involve additional async
@@ -791,10 +802,13 @@ class AsyncLLM(EngineClient):
         # Note that this is not required for correctness, just more intuitive ordering
         # of events from caller's pov.
         await asyncio.sleep(0.02)
+        _partial_rollout_debug_log("vllm_pause_generation_return", mode=mode, clear_cache=clear_cache)
 
     async def resume_generation(self) -> None:
         """Resume generation after :meth:`pause_generation`."""
+        _partial_rollout_debug_log("vllm_resume_generation_begin")
         await self.engine_core.resume_scheduler_async()
+        _partial_rollout_debug_log("vllm_resume_generation_complete")
 
     async def is_paused(self) -> bool:
         """Return whether the engine is currently paused."""
